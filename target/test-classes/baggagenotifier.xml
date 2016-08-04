@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:validation="http://www.mulesoft.org/schema/mule/validation" xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:db="http://www.mulesoft.org/schema/mule/db" xmlns:json="http://www.mulesoft.org/schema/mule/json" xmlns:vm="http://www.mulesoft.org/schema/mule/vm" xmlns:tracking="http://www.mulesoft.org/schema/mule/ee/tracking" xmlns="http://www.mulesoft.org/schema/mule/core" xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:spring="http://www.springframework.org/schema/beans" 
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans-current.xsd
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/json http://www.mulesoft.org/schema/mule/json/current/mule-json.xsd
+http://www.mulesoft.org/schema/mule/ee/tracking http://www.mulesoft.org/schema/mule/ee/tracking/current/mule-tracking-ee.xsd
+http://www.mulesoft.org/schema/mule/vm http://www.mulesoft.org/schema/mule/vm/current/mule-vm.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/validation http://www.mulesoft.org/schema/mule/validation/current/mule-validation.xsd">
+    
+    <flow name="BaggageNotifier-MainFlow">
+        <poll doc:name="Poll">
+            <fixed-frequency-scheduler frequency="300" startDelay="10" timeUnit="SECONDS"/>
+            <db:select config-ref="MySQL_Configuration" doc:name="Database">
+                <db:parameterized-query><![CDATA[SELECT * FROM BaggageProcessingEvent 
+WHERE id not in (
+	SELECT BPM_ID from BaggageProcessingXRef
+	WHERE XMATTERS_ID IS NULL
+	AND (PROCESSED_DATE IS NULL 
+		OR (PROCESSED_DATE IS NOT NULL AND RECEIVED_DATE IS NULL)
+	)
+)]]></db:parameterized-query>
+            </db:select>
+        </poll>
+        <logger message="Received Items #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger Receipt of Payload"/>
+        <collection-splitter doc:name="Collection Splitter"/>
+        <logger message="Now processing #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger Processing of Item"/>
+        <vm:outbound-endpoint exchange-pattern="request-response" path="individualProcessing" connector-ref="VM" doc:name="VM Queue - Send for Processing"/>
+        <logger message="Received Return of #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger Return of Processed Item"/>
+        <collection-aggregator failOnTimeout="true" doc:name="Collection Aggregator"/>
+        <logger message="Final Collection #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger Final Collection"/>
+    </flow>
+    <flow name="BaggageNotifier-individualProcessing">
+        <vm:inbound-endpoint exchange-pattern="request-response" path="individualProcessing" connector-ref="VM" doc:name="VM - individualProcessing"/>
+        <logger message="Received Individual Receipt of #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger - Receipt of Inidividual Record"/>
+        <json:object-to-json-transformer doc:name="Object to JSON"/>
+        <set-variable variableName="type" value="#[json:TYPE]" doc:name="Set Type Variable"/>
+        <set-variable variableName="bpmId" value="#[json:id]" doc:name="Set BPMID Variable"/>
+        <validation:is-true config-ref="Validation_Configuration" expression="#[flowVars.type == 'NOT' || flowVars.type == 'ACK']" doc:name="Validation that type is either ACK or NOT"/>
+        <choice doc:name="Choice - Acknowledgement or Notification">
+            <when expression="#[flowVars.type=='ACK']">
+                <enricher target="#[flowVars.xMattersId]" doc:name="Message Enricher">
+                    <db:select config-ref="MySQL_Configuration" doc:name="Database">
+                        <db:parameterized-query><![CDATA[SELECT XMATTERS_ID from BaggageProcessingXRef
+WHERE BPM_ID=#[message.payload.bpm_id]]]></db:parameterized-query>
+                    </db:select>
+                </enricher>
+            </when>
+            <otherwise>
+                <logger message="Nothing needs to be done with Message -&gt; #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger Message Type NOT needs no enrichement"/>
+            </otherwise>
+        </choice>
+        <validation:is-true config-ref="Validation_Configuration" expression="#[flowVars.type=='NOT' || (flowVars.type=='ACK' &amp;&amp; flowVars.xMattersId!=null)]" doc:name="Validation Ensure that if it is an Acknowledge, there is a BPMID"/>
+        <enricher target="#[flowVars.dbSuccess]" doc:name="Message Enricher">
+            <db:insert config-ref="MySQL_Configuration" doc:name="Database - INSERT New XREF Row">
+                <db:parameterized-query><![CDATA[INSERT INTO BaggageProcessingXRef(BPM_ID,PROCESSED_DATE,TYPE)
+VALUES(#[json:id],#[server.dateTime.toDate()],#[flowVars.type])]]></db:parameterized-query>
+            </db:insert>
+        </enricher>
+        <set-variable variableName="returnId" value="#[flowVars.bpmId]" doc:name="Variable -&gt; This fakes out the xMatters Call"/>
+        <set-payload value="{&quot;xMattersId&quot;:#[flowVars.returnId],&quot;type&quot;:#[flowVars.type]}" mimeType="application/json" doc:name="Set Return Payload"/>
+        <logger message="Returning Payload -&gt; #[message.payloadAs(java.lang.String)]" level="INFO" doc:name="Logger - Returning Payload"/>
+        <enricher target="#[flowVars.dbSuccess]" doc:name="Message Enricher">
+            <db:update config-ref="MySQL_Configuration" doc:name="Database">
+                <db:parameterized-query><![CDATA[UPDATE BaggageProcessingXRef
+SET XMATTERS_ID=#[flowVars.returnId],RECEIVED_DATE=#[server.dateTime.toDate()]
+WHERE BPM_ID=#[flowVars.bpmId] AND TYPE=#[flowVars.type]]]></db:parameterized-query>
+            </db:update>
+        </enricher>
+    </flow>
+</mule>
